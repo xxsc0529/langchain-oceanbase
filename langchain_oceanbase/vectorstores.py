@@ -399,16 +399,32 @@ class OceanbaseVectorStore(VectorStore):
             params=self.vidx_algo_params,
         )
         
-        # Add sparse vector index if enabled
+        sparse_vidx_needs_manual_sql = False
+        sparse_index_type_with = None
         if self.include_sparse:
-            vidx_params.add_index(
-                field_name=self.sparse_vector_field,
-                index_type="daat",  # DAAT index for sparse vectors
-                index_name=f"{self.vidx_name}_sparse",
-                metric_type="inner_product",
-            )
+            is_seekdb = False
+            try:
+                is_seekdb = self.obvector._is_seekdb()
+            except (AttributeError, Exception):
+                pass
+            
+            if not is_seekdb:
+                try:
+                    with self.obvector.engine.connect() as conn:
+                        result = conn.execute(text("SELECT VERSION()"))
+                        version_str = [r[0] for r in result][0]
+                        is_seekdb = "SeekDB" in version_str
+                        logger.debug(f"Version query result: {version_str}, is_seekdb: {is_seekdb}")
+                except Exception as e:
+                    logger.warning(f"Failed to query version: {e}")
+            
+            sparse_vidx_needs_manual_sql = True
+            if is_seekdb:
+                sparse_index_type_with = "sindi"
+            else:
+                sparse_index_type_with = None
+            logger.debug(f"Sparse index config: is_seekdb={is_seekdb}, sparse_index_type_with={sparse_index_type_with}")
 
-        # Prepare FTS indexes if enabled
         fts_idxs = None
         if self.include_fulltext:
             fts_idxs = [
@@ -419,14 +435,66 @@ class OceanbaseVectorStore(VectorStore):
                 )
             ]
 
-        self.obvector.create_table_with_index_params(
-            table_name=self.table_name,
-            columns=cols,
-            indexes=None,
-            vidxs=vidx_params,
-            fts_idxs=fts_idxs,
-            partitions=self.partition,
-        )
+        if sparse_vidx_needs_manual_sql:
+            from sqlalchemy.schema import CreateTable
+            from pyobvector.schema.ob_table import ObTable
+            
+            table = ObTable(
+                self.table_name,
+                self.obvector.metadata_obj,
+                *cols,
+                extend_existing=True,
+            )
+            
+            create_table_sql = str(CreateTable(table).compile(self.obvector.engine))
+            new_sql = create_table_sql[:create_table_sql.rfind(')')]
+            
+            if sparse_index_type_with:
+                new_sql += f",\n\tVECTOR INDEX {self.vidx_name}_sparse({self.sparse_vector_field}) with (type={sparse_index_type_with}, distance=inner_product)"
+            else:
+                new_sql += f",\n\tVECTOR INDEX {self.vidx_name}_sparse({self.sparse_vector_field}) with (distance=inner_product)"
+            
+            new_sql += "\n)"
+            
+            logger.debug(f"Sparse index SQL: sparse_index_type_with={sparse_index_type_with}, SQL={new_sql}")
+            
+            with self.obvector.engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text(new_sql))
+                    
+                    if self.partition is not None:
+                        conn.execute(
+                            text(f"ALTER TABLE `{self.table_name}` {self.partition.do_compile()}")
+                        )
+                    
+                    for vidx in vidx_params:
+                        from pyobvector.schema.vector_index import VectorIndex
+                        vidx_obj = VectorIndex(
+                            vidx.index_name,
+                            table.c[vidx.field_name],
+                            params=vidx.param_str(),
+                        )
+                        vidx_obj.create(self.obvector.engine, checkfirst=True)
+                    
+                    if fts_idxs is not None:
+                        for fts_idx in fts_idxs:
+                            from pyobvector.schema.full_text_index import FtsIndex
+                            idx_cols = [table.c[field_name] for field_name in fts_idx.field_names]
+                            fts_idx_obj = FtsIndex(
+                                fts_idx.index_name,
+                                fts_idx.param_str(),
+                                *idx_cols,
+                            )
+                            fts_idx_obj.create(self.obvector.engine, checkfirst=True)
+        else:
+            self.obvector.create_table_with_index_params(
+                table_name=self.table_name,
+                columns=cols,
+                indexes=None,
+                vidxs=vidx_params,
+                fts_idxs=fts_idxs,
+                partitions=self.partition,
+            )
 
     def _create_table_with_index(self, embeddings: list) -> None:
         if self.obvector.check_table_exists(self.table_name):
