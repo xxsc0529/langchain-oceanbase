@@ -1003,17 +1003,34 @@ class OceanbaseVectorStore(VectorStore):
     ) -> List[str]:
         """
         Add documents with sparse vector embeddings.
+        
+        Note: This method uses upsert behavior. If documents with the same IDs already
+        exist, they will be updated rather than creating duplicates. To add both sparse
+        and fulltext fields to the same documents, use the same IDs for both calls, or
+        use `add_documents_with_hybrid_fields` to add both in a single call.
 
         Args:
             documents: List of documents to add
             sparse_embeddings: List of sparse vector embeddings (dict of index: value)
-            ids: Optional list of document IDs
+            ids: Optional list of document IDs. If not provided, will be generated.
+                 If provided and documents with these IDs already exist, they will be
+                 updated (upsert behavior).
 
         Returns:
             List of document IDs
             
         Raises:
             ValueError: If sparse vector support is not enabled
+            
+        Example:
+            .. code-block:: python
+            
+                # First add documents with fulltext
+                ids = store.add_documents_with_fulltext(documents, fulltext_content)
+                
+                # Then add sparse embeddings to the same documents (using same IDs)
+                store.add_sparse_documents(documents, sparse_embeddings, ids=ids)
+                # This will update existing records instead of creating duplicates
         """
         if not self.include_sparse:
             raise ValueError(
@@ -1045,8 +1062,12 @@ class OceanbaseVectorStore(VectorStore):
             }
             data.append(record)
         
-        # Insert data using ObVecClient
-        self.obvector.insert(self.table_name, data)
+        # Upsert data using ObVecClient (upsert updates existing records with same ID)
+        self.obvector.upsert(
+            table_name=self.table_name,
+            data=data,
+            partition_name="",
+        )
         return ids
     
     def add_documents_with_fulltext(
@@ -1058,16 +1079,33 @@ class OceanbaseVectorStore(VectorStore):
         """
         Add documents with full-text content for full-text search.
         
+        Note: This method uses upsert behavior. If documents with the same IDs already
+        exist, they will be updated rather than creating duplicates. To add both sparse
+        and fulltext fields to the same documents, use the same IDs for both calls, or
+        use `add_documents_with_hybrid_fields` to add both in a single call.
+        
         Args:
             documents: List of documents to add
             fulltext_content: List of full-text content strings
-            ids: Optional list of document IDs
+            ids: Optional list of document IDs. If not provided, will be generated.
+                 If provided and documents with these IDs already exist, they will be
+                 updated (upsert behavior).
             
         Returns:
             List of document IDs
             
         Raises:
             ValueError: If full-text search support is not enabled
+            
+        Example:
+            .. code-block:: python
+            
+                # First add documents with sparse embeddings
+                ids = store.add_sparse_documents(documents, sparse_embeddings)
+                
+                # Then add fulltext to the same documents (using same IDs)
+                store.add_documents_with_fulltext(documents, fulltext_content, ids=ids)
+                # This will update existing records instead of creating duplicates
         """
         if not self.include_fulltext:
             raise ValueError(
@@ -1099,8 +1137,114 @@ class OceanbaseVectorStore(VectorStore):
             }
             data.append(record)
         
-        # Insert data using ObVecClient
-        self.obvector.insert(self.table_name, data)
+        # Upsert data using ObVecClient (upsert updates existing records with same ID)
+        self.obvector.upsert(
+            table_name=self.table_name,
+            data=data,
+            partition_name="",
+        )
+        return ids
+    
+    def add_documents_with_hybrid_fields(
+        self,
+        documents: List[Document],
+        sparse_embeddings: Optional[List[Dict[int, float]]] = None,
+        fulltext_content: Optional[List[str]] = None,
+        ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        """
+        Add documents with optional sparse vectors and/or full-text content.
+        This method allows adding all hybrid search fields in a single call,
+        avoiding duplicate records when adding sparse and fulltext separately.
+        
+        Args:
+            documents: List of documents to add
+            sparse_embeddings: Optional list of sparse vector embeddings (dict of index: value)
+            fulltext_content: Optional list of full-text content strings
+            ids: Optional list of document IDs. If provided, must match documents length.
+                 If not provided, will be generated. If documents already exist with these IDs,
+                 they will be updated (upsert behavior).
+            
+        Returns:
+            List of document IDs
+            
+        Raises:
+            ValueError: If required features are not enabled or input validation fails
+            
+        Example:
+            .. code-block:: python
+            
+                # Add documents with both sparse and fulltext in one call
+                ids = hybrid_store.add_documents_with_hybrid_fields(
+                    documents=docs,
+                    sparse_embeddings=sparse_embeds,
+                    fulltext_content=fulltext_contents,
+                    ids=existing_ids  # Use same IDs to update existing records
+                )
+        """
+        if sparse_embeddings is None and fulltext_content is None:
+            # If neither sparse nor fulltext provided, use standard add_documents
+            return self.add_documents(documents, ids=ids)
+        
+        if sparse_embeddings is not None and not self.include_sparse:
+            raise ValueError(
+                "Sparse vector support not enabled. Set include_sparse=True when "
+                "initializing."
+            )
+        
+        if fulltext_content is not None and not self.include_fulltext:
+            raise ValueError(
+                "Full-text search support not enabled. Set include_fulltext=True "
+                "when initializing."
+            )
+        
+        if sparse_embeddings is not None and len(documents) != len(sparse_embeddings):
+            raise ValueError(
+                "Number of documents must match number of sparse embeddings"
+            )
+        
+        if fulltext_content is not None and len(documents) != len(fulltext_content):
+            raise ValueError(
+                "Number of documents must match number of fulltext content items"
+            )
+        
+        # Generate IDs if not provided
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in documents]
+        elif len(ids) != len(documents):
+            raise ValueError(
+                "Number of IDs must match number of documents"
+            )
+        
+        # Prepare data for upsert
+        data = []
+        for i, doc in enumerate(documents):
+            # Generate dense embedding for the document
+            dense_embedding = self.embedding_function.embed_query(doc.page_content)
+            
+            record = {
+                self.primary_field: ids[i],
+                self.text_field: doc.page_content,
+                self.vector_field: dense_embedding,
+                self.metadata_field: doc.metadata,
+            }
+            
+            # Add sparse vector if provided
+            if sparse_embeddings is not None:
+                record[self.sparse_vector_field] = sparse_embeddings[i]
+            
+            # Add fulltext if provided
+            if fulltext_content is not None:
+                record[self.fulltext_field] = fulltext_content[i]
+            
+            data.append(record)
+        
+        # Upsert data using ObVecClient (upsert updates existing records with same ID)
+        self.obvector.upsert(
+            table_name=self.table_name,
+            data=data,
+            partition_name="",
+        )
         return ids
 
     def similarity_search_with_sparse_vector(
@@ -1130,16 +1274,32 @@ class OceanbaseVectorStore(VectorStore):
             )
         
         # Perform sparse vector search using ann_search
-        results = self.obvector.ann_search(
+        res = self.obvector.ann_search(
             table_name=self.table_name,
             vec_data=sparse_query,
             vec_column_name=self.sparse_vector_field,
             distance_func=inner_product,
             topk=k,
+            output_column_names=[
+                self.text_field,
+                self.metadata_field,
+                self.primary_field,
+            ],
             where_clause=filter,
         )
         
-        return self._convert_results_to_documents(results)
+        return [
+            Document(
+                id=r[2],
+                page_content=r[0],
+                metadata=(
+                    json.loads(r[1])
+                    if isinstance(r[1], str) or isinstance(r[1], bytes)
+                    else r[1]
+                ),
+            )
+            for r in res.fetchall()
+        ]
     
     def _combine_hybrid_results(
         self, 
